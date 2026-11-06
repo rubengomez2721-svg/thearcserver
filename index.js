@@ -51,6 +51,31 @@ function plain(v, depth = 0) {
 }
 const size = v => { try { return JSON.stringify(v === undefined ? null : v).length; } catch (e) { return Infinity; } };
 
+// Junta dos versiones de una obra (la de aquí y la que llega de otro jugador) sin perder golpes:
+// cada personaje solo suma sus propios golpes, así que de cada uno vale el número mayor.
+// Una obra terminada sigue terminada; el encargo de la mesa (la carretilla) se junta igual.
+function mergeBuild(a, b) {
+  const done = r => !r.fase || r.fase > 3;
+  const maxMap = (x, y) => {
+    const o = { ...(x && typeof x === "object" ? x : {}) };
+    if (y && typeof y === "object") for (const k of Object.keys(y)) o[k] = Math.max(Number(o[k]) || 0, Number(y[k]) || 0);
+    return o;
+  };
+  if (!a || typeof a !== "object") return b;
+  if (!b || typeof b !== "object") return a;
+  const r = { ...b };
+  if (done(a) || done(b)) { delete r.fase; delete r.golpes; delete r.work; delete r.hits; }
+  else {
+    r.golpes = maxMap(a.golpes, b.golpes);
+    r.fase = Math.max(a.fase || 1, b.fase || 1);
+  }
+  const ca = a.craft, cb = b.craft;
+  if (ca && cb && ca.id === cb.id) r.craft = { ...cb, golpes: maxMap(ca.golpes, cb.golpes), done: !!(ca.done || cb.done) };
+  else if (ca && cb) r.craft = String(ca.id) > String(cb.id) ? ca : cb; // el encargo más nuevo
+  else if (ca && !cb) r.craft = ca;
+  return r;
+}
+
 // ---------- El mundo compartido ----------
 // El servidor guarda el mundo de la partida en línea: lo que cambia (árboles talados, objetos recogidos,
 // montones, obras, huerto, fruta, la hora) y las cosas de cada personaje (inventario, vida, dónde está).
@@ -113,7 +138,8 @@ class GameRoom extends Room {
             const v = op.s[k];
             if (size(v) > MAX_VALUE) continue;
             if (!(k in cat) && Object.keys(cat).length >= MAX_KEYS) continue;
-            cat[k] = v; out.s[k] = v;
+            const val = op.c === "builds" && cat[k] ? mergeBuild(cat[k], v) : v;
+            cat[k] = val; out.s[k] = val;
           }
         }
         if (Array.isArray(op.d)) {
