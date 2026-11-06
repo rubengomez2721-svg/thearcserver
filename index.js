@@ -1,4 +1,12 @@
 const http = require("http");
+
+// Si algo falla, se apunta en el log pero el servidor sigue funcionando
+process.on("uncaughtException", e => console.error("Error (el servidor sigue):", e));
+process.on("unhandledRejection", e => console.error("Error (el servidor sigue):", e));
+// Envuelve lo que hace la sala al recibir un mensaje: un mensaje raro no tumba nada
+const safe = (name, fn) => function (...args) {
+  try { return fn.apply(this, args); } catch (e) { console.error(`Error en "${name}":`, e); }
+};
 const express = require("express");
 const cors = require("cors");
 const { Server, Room } = require("colyseus");
@@ -31,6 +39,18 @@ class GameState extends Schema {
 }
 defineTypes(GameState, { players: { map: Player } });
 
+// Los números muy grandes (como la hora a la que se cogió una fruta) llegan como BigInt:
+// se pasan a números normales para poder guardarlos y reenviarlos
+function plain(v, depth = 0) {
+  if (typeof v === "bigint") return Number(v);
+  if (!v || typeof v !== "object" || depth > 12) return v;
+  if (Array.isArray(v)) return v.map(x => plain(x, depth + 1));
+  const o = {};
+  for (const k of Object.keys(v)) o[k] = plain(v[k], depth + 1);
+  return o;
+}
+const size = v => { try { return JSON.stringify(v === undefined ? null : v).length; } catch (e) { return Infinity; } };
+
 // ---------- El mundo compartido ----------
 // El servidor guarda el mundo de la partida en línea: lo que cambia (árboles talados, objetos recogidos,
 // montones, obras, huerto, fruta, la hora) y las cosas de cada personaje (inventario, vida, dónde está).
@@ -55,7 +75,7 @@ function cleanWorld(data) {
     for (const k of Object.keys(src)) {
       if (++n > MAX_KEYS) break;
       const v = src[k];
-      if (JSON.stringify(v === undefined ? null : v).length <= MAX_VALUE) w[c][String(k).slice(0, 64)] = v;
+      if (size(v) <= MAX_VALUE) w[c][String(k).slice(0, 64)] = v;
     }
   }
   w.rev = Number(data.rev) || 1;
@@ -80,7 +100,8 @@ class GameRoom extends Room {
     this.setMetadata({ taken: {} });
 
     // Cambios en el mundo: { ops: [{ c: categoría, s: { clave: valor }, d: [claves borradas] }] }
-    this.onMessage("w", (client, data) => {
+    this.onMessage("w", safe("w", (client, data) => {
+      data = plain(data);
       if (!worldReady || !data || !Array.isArray(data.ops)) return;
       const ops = [];
       for (const op of data.ops.slice(0, 200)) {
@@ -90,7 +111,7 @@ class GameRoom extends Room {
           out.s = {};
           for (const k of Object.keys(op.s).slice(0, 2000)) {
             const v = op.s[k];
-            if (JSON.stringify(v === undefined ? null : v).length > MAX_VALUE) continue;
+            if (size(v) > MAX_VALUE) continue;
             if (!(k in cat) && Object.keys(cat).length >= MAX_KEYS) continue;
             cat[k] = v; out.s[k] = v;
           }
@@ -104,26 +125,31 @@ class GameRoom extends Room {
       if (!ops.length) return;
       world.rev++;
       this.broadcast("w", { ops }, { except: client });
-    });
+    }));
 
     // El juego, ya preparado, pide el mundo
-    this.onMessage("hello", client => {
+    this.onMessage("hello", safe("hello", client => {
       client.send("world", { world, empty: !worldReady, lead: client.sessionId === this.leadId });
-    });
+    }));
 
     // Copia del mundo que trae un jugador: solo se usa si el servidor aún no tiene mundo
-    this.onMessage("backup", (client, data) => {
+    this.onMessage("backup", safe("backup", (client, data) => {
+      data = plain(data);
       if (!worldReady) {
         world = cleanWorld(data);
         worldReady = true;
         console.log("Mundo recuperado de la copia de", client.sessionId);
         this.clients.forEach(c => c.send("world", { world, empty: false, lead: c.sessionId === this.leadId }));
       } else client.send("world", { world, empty: false, lead: client.sessionId === this.leadId });
-    });
+    }));
     this.setPatchRate(50); // ~20 actualizaciones por segundo
 
+    // Mensajes que este servidor no conoce (de otra versión del juego): se ignoran sin echar al jugador
+    this.onMessage("*", () => {});
+
     // El cliente envía su posición (y hacia dónde mira, si anda, su personaje…); el servidor la valida y la reparte
-    this.onMessage("move", (client, data) => {
+    this.onMessage("move", safe("move", (client, data) => {
+      data = plain(data);
       const player = this.state.players.get(client.sessionId);
       if (!player || !data) return;
       if (typeof data.x === "number" && typeof data.y === "number" && isFinite(data.x) && isFinite(data.y)) {
@@ -138,7 +164,7 @@ class GameRoom extends Room {
         this.syncMeta();
       }
       if (SCENES.includes(data.scene)) player.scene = data.scene;
-    });
+    }));
   }
 
   // El primer jugador de la sala lleva la hora del día (los demás la siguen)
@@ -199,7 +225,8 @@ app.get("/", (req, res) => res.send("Servidor del juego funcionando"));
 
 const server = http.createServer(app);
 const gameServer = new Server({
-  transport: new WebSocketTransport({ server }),
+  // mensajes de hasta 2 MB (la copia del mundo es grande; por defecto solo se admiten 4 KB)
+  transport: new WebSocketTransport({ server, maxPayload: 2 * 1024 * 1024 }),
 });
 
 gameServer.define("sala", GameRoom);
